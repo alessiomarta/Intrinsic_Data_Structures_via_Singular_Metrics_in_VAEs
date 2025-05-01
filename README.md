@@ -1,4 +1,4 @@
-# Intrinsic_Data_Structures_via-Singular_Metrics_in_VAEs
+# Intrinsic_Data_Structures_via_Singular_Metrics_in_VAEs
 Code for the numerical experiments of the paper "Estimation of Intrinsic Data Structures via Singular Metrics in VAEs: Application to Inverse Problems".
 
 This repository contains the code for the numerical experiments of the paper "Estimation of Intrinsic Data Structures via Singular Metrics in VAEs: Application to Inverse Problems"
