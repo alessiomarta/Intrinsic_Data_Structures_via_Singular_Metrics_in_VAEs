@@ -5,10 +5,11 @@ import torch
 import generate_data
 
 class ImagesDataset(Dataset):
-    def __init__(self, epoch_size=1,transform=None,start_seed=None,std_intensity=0.1,test=False,intensity_dist='gauss',eps=4,fix_int=False,device=None,n_balls=2):     
+    def __init__(self, epoch_size=1,transform=None,start_seed=None,std_intensity=0.1,test=False,intensity_dist='gauss',eps=4,fix_int=False,device=None,n_balls=2, include_dots = False):     
         self.len=epoch_size
         self.transform=transform
         self.n_balls=n_balls
+        self.start_seed=start_seed
         self.std_intensity=std_intensity
         self.test=test
         self.intensity_dist=intensity_dist

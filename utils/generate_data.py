@@ -5,6 +5,8 @@ import math
 import numpy as np
 import random
 
+#TODO: RIMUOVERE GLI ARGOMENTI DI TROPPO E LE OPZIONI DI INTENSITY DIST
+
 def generate_image(n_balls,seed=None,std_intensity=0.1,intensity_dist='gauss',eps=2,fix_int=False, dimension=128):
     x_c_v = dimension/2.
     y_c_v = dimension/2.

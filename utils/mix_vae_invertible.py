@@ -5,10 +5,10 @@
 import torch.nn as nn
 import torch
 import numpy as np
+from utils.general import get_device
 import copy
 
-
-device = "cuda"
+device = get_device()
 
 class Mix_VAE(nn.Module):
     def __init__(self,decoders,learn_decoder_weights=False):
@@ -17,10 +17,11 @@ class Mix_VAE(nn.Module):
         self.encoders=[]
         for ng,decoder in enumerate(self.decoders):
             self.add_module("Generator_"+str(ng),decoder)
-            self.encoders.append(decoders[ng])
+            self.encoders.append(decoders[ng].backward)
         self.learn_decoder_weights=learn_decoder_weights
         log_decoder_weights=torch.zeros(len(self.decoders),dtype=torch.float,device=device)/len(self.decoders)
         self.log_decoder_weights=nn.Parameter(log_decoder_weights,requires_grad=False)
+        self.relevant_region=self.decoders[0].relevant_region
 
     def get_log_decoder_weights(self):
         log_decoder_weights=self.log_decoder_weights-torch.max(self.log_decoder_weights)
@@ -35,7 +36,7 @@ class Mix_VAE(nn.Module):
         losses=[]
         log_decoder_weights=self.get_log_decoder_weights()
         for ng in range(len(self.decoders)):
-            loss=self.decoders[ng].negative_ELBO(xs)[0]
+            loss=self.decoders[ng].negative_ELBO(xs)
             loss-=log_decoder_weights[ng]
             losses.append(loss.squeeze())
         losses=torch.stack(losses,-1)
@@ -59,7 +60,7 @@ class Mix_VAE(nn.Module):
         losses_add=[]
         log_decoder_weights=self.get_log_decoder_weights()
         for ng in range(len(self.encoders)):
-            loss,loss_add=self.decoders[ng].negative_ELBO(xs)[0]
+            loss,loss_add=self.decoders[ng].negative_ELBO(xs,scale=scale)
             losses_add.append(loss_add)
             loss-=log_decoder_weights[ng]
             losses.append(loss.squeeze())
@@ -93,6 +94,217 @@ class Mix_VAE(nn.Module):
             return weights
         weights=torch.exp(weights)
         return weights
+
+    def create_trajectory(self,point,f,step_size,steps,f_der=None,retraction='project',print_steps=10,use_prior_lambda=None,add_noise=0.):
+        with torch.no_grad():
+            trajectory=[point.detach().cpu().squeeze().numpy()]
+            speed=[]
+            objectives=[]
+            step=0
+            while step<steps:
+                chart_probs=self.classify(point).detach().cpu().squeeze().numpy()
+                if len(chart_probs.shape)==0:
+                    chart_probs=chart_probs[None]
+                if step%print_steps==0:
+                    dists=[]
+                    dists_m=[]
+                    for chart_nr in range(len(self.decoders)):
+                        point2=point
+                        point_chart=self.decoders[chart_nr](self.encoders[chart_nr](point2))
+                        dists.append((torch.sum(point_chart-point2)**2).item())
+                        dists_m.append((torch.mean(point_chart-point2)**2).item())
+                    print(dists,dists_m)
+                    print(step,chart_probs)
+                point_new=torch.zeros_like(point)
+                local_coord_norm_list=[]
+                for chart_nr in range(len(self.decoders)):
+                    if chart_probs[chart_nr]<1e-6:
+                        # ignore all charts whose probability is approximately zero
+                        continue
+                    local_coord=self.encoders[chart_nr](point)
+                    local_coord+=add_noise*torch.randn_like(local_coord)
+                    local_coord_norm_list.append(torch.sum(local_coord**2).item())
+                    local_coord.requires_grad_()
+                    with torch.enable_grad():
+                        jacobian=torch.autograd.functional.jacobian(self.decoders[chart_nr],local_coord,vectorize=True,strategy='forward-mode')
+                    jacobian=torch.reshape(jacobian,(point.numel(),self.decoders[chart_nr].dim_ld))
+                    jacobian_sym=torch.matmul(jacobian.transpose(0,1),jacobian)
+                    if f_der is None:
+                        with torch.enable_grad():
+                            global_coords=self.decoders[chart_nr](local_coord)
+                            obj=f(global_coords)
+                            derivative=torch.autograd.grad(obj,local_coord)[0]
+                    else:
+                        global_coords=self.decoders[chart_nr](local_coord)
+                        der,obj=f_der(global_coords.detach().cpu().numpy(),forward_sensitivities=jacobian.detach().cpu().numpy())
+                        derivative=torch.tensor(der,dtype=torch.float,device=device)[None,:]
+                    if not use_prior_lambda is None:
+                        with torch.enable_grad():
+                            loss=use_prior_lambda*torch.sum(torch.nn.functional.relu(torch.abs(local_coord)-1))
+                            derivative_add=torch.autograd.grad(loss,local_coord)[0]
+                        derivative=derivative+derivative_add
+                    if retraction=='project':
+                        riemannian_gradient=torch.linalg.solve(jacobian_sym,derivative[0])[None,:]
+                        riemannian_gradient=torch.matmul(riemannian_gradient,jacobian.transpose(0,1))
+                        riemannian_gradient=torch.reshape(riemannian_gradient,point.shape)
+                        local_coord=self.encoders[chart_nr](point-step_size*riemannian_gradient)
+                        chart_point_new=self.decoders[chart_nr](local_coord)
+                    if retraction=='chart_retraction':
+                        riemannian_gradient_chart_basis=torch.linalg.solve(jacobian_sym,derivative[0])[None,:]
+                        local_coord=local_coord-step_size*riemannian_gradient_chart_basis
+                        chart_point_new=self.decoders[chart_nr](local_coord)                
+                    if retraction=='non-riemannian':
+                        riemannian_gradient_chart_basis=derivative
+                        local_coord=local_coord-step_size*riemannian_gradient_chart_basis
+                        chart_point_new=self.decoders[chart_nr](local_coord)                
+                    if step%print_steps==0:
+                        print(step,obj,local_coord.detach().cpu().numpy())
+                    point_new+=chart_probs[chart_nr]*chart_point_new
+                if f_der is None:
+                    objectives.append(obj.detach().cpu().numpy())
+                else:
+                    objectives.append(obj)
+                if step>0:
+                    speed.append(torch.sum((point_new-point)**2).detach().cpu().numpy())    
+                    if step%print_steps==0:
+                        print(speed[-1])
+                point=point_new
+                if step%print_steps==0:
+                    print(point)
+                trajectory.append(point.detach().cpu().squeeze().numpy())
+                step+=1
+            loss=torch.tensor(0,dtype=torch.float,device=device)
+            if f_der is None:
+                obj=f(point)+loss
+            else:
+                obj=f(point.detach().cpu().squeeze().numpy())+loss
+            objectives.append(obj.detach().cpu().squeeze().numpy())
+            trajectory=np.stack(trajectory)
+            return trajectory,speed,objectives
+
+    def create_trajectory_adaptive(self,point,f,step_size,steps,f_der=None,retraction='project',print_steps=1,use_prior_lambda=None,min_step_size=None,max_step_size=None):
+        best_chart=-1
+        with torch.no_grad():
+            trajectory=[point.detach().cpu().squeeze().numpy()]
+            speed=[]
+            objectives=[]
+            step=0
+            loss=torch.tensor(0,dtype=torch.float,device=device)
+            if f_der is None:
+                old_obj=f(point)+loss
+            else:
+                old_obj=f(point.detach().cpu().squeeze().numpy())+loss
+            objectives.append(old_obj.detach().cpu().squeeze().numpy())
+            while step<steps:
+                chart_probs=self.classify(point).detach().cpu().squeeze().numpy()
+                dists=[]
+                for chart_nr in range(len(self.decoders)):
+                    local_coords=self.encoders[chart_nr](point)
+                    point_chart=self.decoders[chart_nr](local_coords)
+                    print(self.decoders[chart_nr].negative_ELBO(point),self.decoders[chart_nr].negative_ELBO(point_chart))
+                    dist=torch.sum((point_chart-point)**2)
+                    dists.append(dist.item())              
+                print(dists)
+                if len(chart_probs.shape)==0:
+                    chart_probs=chart_probs[None]
+                if step%print_steps==0:
+                    print(step,chart_probs)
+                local_coord_norm_list=[]
+                riemannian_gradients_list=[]
+                local_coord_list=[]
+                omitted_prob=0
+                for chart_nr in range(len(self.decoders)):
+                    if chart_probs[chart_nr]<1e-6:
+                        local_coord_list.append(None)
+                        riemannian_gradients_list.append(None)
+                        omitted_prob+=chart_probs[chart_nr]
+                        # ignore all charts whose probability is approximately zero
+                        continue
+                    local_coord=self.encoders[chart_nr](point)                      
+                    local_coord_list.append(local_coord)
+                    local_coord_norm_list.append(torch.sum(local_coord**2).item())
+                    local_coord.requires_grad_()
+                    with torch.enable_grad():
+                        jacobian=torch.autograd.functional.jacobian(self.decoders[chart_nr],local_coord,vectorize=True,strategy='forward-mode')
+                    jacobian=torch.reshape(jacobian,(point.numel(),self.decoders[chart_nr].dim_ld))
+                    jacobian_sym=torch.matmul(jacobian.transpose(0,1),jacobian)
+                    if f_der is None:
+                        with torch.enable_grad():
+                            global_coords=self.decoders[chart_nr](local_coord)
+                            obj=f(global_coords)
+                            derivative=torch.autograd.grad(obj,local_coord)[0]
+                    else:
+                        global_coords=self.decoders[chart_nr](local_coord)
+                        der,obj=f_der(global_coords.detach().cpu().numpy(),forward_sensitivities=jacobian.detach().cpu().numpy())
+                        derivative=torch.tensor(der,dtype=torch.float,device=device)[None,:]
+                    if not use_prior_lambda is None:
+                        with torch.enable_grad():
+                            loss=use_prior_lambda*torch.sum(torch.nn.functional.relu(-1-local_coord)+torch.nn.functional.relu(1+local_coord))
+                            derivative_add=torch.autograd.grad(loss,local_coord)[0]
+                        derivative=derivative+derivative_add
+                    if retraction=='project':
+                        riemannian_gradient=torch.linalg.solve(jacobian_sym,derivative[0])[None,:]
+                        riemannian_gradient=torch.matmul(riemannian_gradient,jacobian.transpose(0,1))
+                        riemannian_gradient=torch.reshape(riemannian_gradient,point.shape)
+                    if retraction=='chart_retraction':
+                        riemannian_gradient=torch.linalg.solve(jacobian_sym,derivative[0])[None,:]
+                    if retraction=='non-riemannian':
+                        riemannian_gradient=derivative
+                    riemannian_gradients_list.append(riemannian_gradient)
+                for i in range(20):
+                    point_new=torch.zeros_like(point)
+                    for chart_nr in range(len(self.decoders)):
+                        if local_coord_list[chart_nr] is None:
+                            continue
+                        riemannian_gradient=riemannian_gradients_list[chart_nr]
+                        local_coord=local_coord_list[chart_nr]
+                        if retraction=='project':
+                            local_coord=self.encoders[chart_nr](point-step_size*riemannian_gradient)
+                            chart_point_new=self.decoders[chart_nr](local_coord)
+                        if retraction=='chart_retraction' or retraction=='non-riemannian':
+                            riemannian_gradient_chart_basis=riemannian_gradient
+                            local_coord=local_coord-step_size*riemannian_gradient_chart_basis
+                            chart_point_new=self.decoders[chart_nr](local_coord)
+                        point_new+=chart_probs[chart_nr]*chart_point_new
+                    point_new/=(1-omitted_prob)
+                    loss=torch.tensor(0,dtype=torch.float,device=device)
+                    if f_der is None:
+                        obj_new=f(point_new)+loss
+                    else:
+                        obj_new=f(point_new.detach().cpu().numpy())+loss
+                    if obj_new<=1.001*old_obj:
+                        step_size*=1.5
+                        if not max_step_size is None and step_size>max_step_size:
+                            step_size=max_step_size
+                        print('New step size:',step_size)
+                        break
+                    if not min_step_size is None and step_size<min_step_size:
+                        step_size=min_step_size
+                        print('New step size:',step_size)
+                        break
+                    step_size/=2.
+                    print('reduce step size! Step:',step,'New step size:',step_size,'obj old:',old_obj.detach().cpu().numpy(),'obj new:',obj_new.detach().cpu().numpy(),'asdf',((point_new-point)**2).sum().detach().cpu().numpy())
+                if obj_new>old_obj:
+                    step_size/=3
+                    print('reduce step size! New step size: ',step_size)
+                if i>=99:
+                    print('Step size could not be small enough!')
+                    print(step_size)
+                    break
+                print('New objective:',obj_new.detach().cpu().squeeze().numpy())
+                old_obj=obj_new
+                objectives.append(obj_new.detach().cpu().numpy())
+                if step>0:
+                    speed.append(torch.sum((point_new-point)**2).detach().cpu().numpy())    
+                    if step%print_steps==0:
+                        print(speed[-1])
+                point=point_new
+                if step%print_steps==0:
+                    print(local_coord)
+                trajectory.append(point.detach().cpu().squeeze().numpy())
+                step+=1
+            trajectory=np.stack(trajectory)
+            return trajectory,speed,objectives
 
     def train_epochs_dl(self,train_dataloader,optimizer,epochs=1,scale=None,set_sig_ld=None,normalize=True,gradient_clipping=None,first_epochs=None):
         if not train_dataloader.drop_last:
@@ -168,10 +380,11 @@ class Mix_VAE(nn.Module):
                 logpzs=[]
                 log_decoder_weights=self.get_log_decoder_weights()
                 for ng in range(len(self.decoders)):
-                    loss=self.decoders[ng].negative_ELBO(xs)[0]
+                    loss,logpz=self.decoders[ng].negative_ELBO(xs,return_latent_probs=True)
                     loss-=log_decoder_weights[ng]
                     losses.append(loss.squeeze())
-
+                    logpzs.append(logpz)
+                logpzs=torch.stack(logpzs,-1)
                 losses=torch.stack(losses,-1)
                 weights=-torch.clone(losses)
                 weights=weights-torch.max(weights,-1,keepdim=True)[0]
@@ -189,13 +402,28 @@ class Mix_VAE(nn.Module):
                         loss=Lipschitz_loss*self.decoders[ng].Lipschitz_loss(xs.shape[0])
                         loss.backward()
                 
+                if metric_loss:
+                    for ng in range(len(self.encoders)):
+                        loss=1000.*self.decoders[ng].metric_loss(xs[:8])
+                        print(loss)
+                        loss.backward()
+                
+                
+                if penalize_dimensions:
+                    loss = 0.
+                    for ng in range(len(self.encoders)):    
+                        loss = self.decoders[ng].metric_score_batch(4)
+                        print(loss)
+                        print("---------------------------------------")
+                        loss.backward()
+                                
+                
                 if not gradient_clipping is None:
                     torch.nn.utils.clip_grad_norm_(self.parameters(),gradient_clipping)
                 optimizer.step()
                 loss_vals.append(loss_sum.item()/train_dataloader.batch_size)
                 loss_vals_gen.append((loss_sum_0).detach().cpu().numpy())
-
-            loss_vals_gen=np.stack(loss_vals_gen).sum()/weight_sum.detach().cpu().numpy()
+            loss_vals_gen=np.stack(loss_vals_gen)/weight_sum.detach().cpu().numpy()
             decoder_weights=weight_sum/weight_sum.sum()
             pen_loss=np.sum(penalizers)/np.sum(weight_sum.detach().cpu().numpy())
             print(decoder_weights.detach().cpu().numpy())
@@ -207,7 +435,7 @@ class Mix_VAE(nn.Module):
         optimizer.zero_grad()
         losses=[]
         for ng in range(len(self.decoders)):
-            loss=self.decoders[ng].negative_ELBO(xs)[0]
+            loss=self.decoders[ng].negative_ELBO(xs)
             losses.append(loss.squeeze())
         losses=torch.stack(losses,-1)
         loss_sum_gs=torch.sum(losses*weights,0)
@@ -232,11 +460,15 @@ class Mix_VAE(nn.Module):
         i=0
         print("for xs,inds in train_dataloader:...")
         for xs,inds in train_dataloader:
+            #print(xs,flush=True)
             xs.to(device)
+            #print(i)
             if i==0:
                 if centers is None:
                     centers=[]
                     for c in range(seeding_candidates):
+                        #print(xs.shape)
+                        #print(c)
                         centers.append(xs[c])
                     centers=torch.stack(centers)
                 centers_vec=centers.view(centers.shape[0],-1)
@@ -267,10 +499,11 @@ class Mix_VAE(nn.Module):
                         perm=torch.argsort(dists)
                         closest[ng]=closest[ng][perm[:num_samples]]
             i+=1
-
+            #print(i)
         print('found closest...')
         for ng in range(len(self.decoders)):
             print(F'Initialize decoder {ng}',flush=True)
+            #optimizer=torch.optim.Adam(self.decoders[ng].parameters(), lr = learning_rate)
             optimizer=torch.optim.Adam(filter(lambda p: p.requires_grad, self.decoders[ng].parameters()), lr = learning_rate)
 
            
@@ -282,7 +515,7 @@ class Mix_VAE(nn.Module):
                 while i<closest[ng].shape[0]:
                     optimizer.zero_grad()
                     xs=closest[ng][i:i+batch_size].to(device)
-                    loss=self.decoders[ng].negative_ELBO(xs)[0].sum()
+                    loss=torch.mean(self.decoders[ng].negative_ELBO(xs))
                     loss.backward()
                     optimizer.step()
                     i+=batch_size
@@ -294,6 +527,7 @@ class Mix_VAE(nn.Module):
                 if (ep+1)%100==0:
                     print('Init generator:',ng,'step:',ep+1,'loss:',mean_loss,'best loss:',best_loss, flush=True)
             self.decoders[ng].load_state_dict(best_states)
+        #optimizer=torch.optim.Adam(self.parameters(),lr=learning_rate)
         optimizer=torch.optim.Adam(filter(lambda p: p.requires_grad, self.parameters()),lr=learning_rate)
         print('SEEDING COMPLETED',flush=True)
 
@@ -308,7 +542,7 @@ class Mix_VAE(nn.Module):
                 losses=[]
                 log_decoder_weights=self.get_log_decoder_weights()
                 for ng in range(len(self.decoders)):
-                    loss=self.decoders[ng].negative_ELBO(xs)[0]
+                    loss=self.decoders[ng].negative_ELBO(xs)
                     loss-=log_decoder_weights[ng]
                     losses.append(loss.squeeze())
                 losses=torch.stack(losses,-1)
