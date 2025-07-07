@@ -18,5 +18,4 @@ The code for the mixture of VAEs is an adaption of https://github.com/johertrich
 - The scripts `dimension_estimate_img.py` and `dimension_estimate_sin.py` contains the code to estimate the intrinsic dimension of the manifold learned by the Whiteny embedding VAEs.
 - The scripts `comparison_dimension_estimate_imgs.py` and `comparison_dimension_estimate_sins.py` contains the code to compare our dimension estimate with other three ID estimation methods.
 - The scripts `generate_charts_img.py` and `generate_charts_sin.py` contains the code to generate the local charts for the learned manifolds.
-- The scripts `plot_charts_img.py` and `plot_charts_sin.py` contains the code to plot the local charts for the learned manifolds.
 - The script `pruning_img_net.py` contains the code to prune the VAE performing the Whitney embedding of the images.
