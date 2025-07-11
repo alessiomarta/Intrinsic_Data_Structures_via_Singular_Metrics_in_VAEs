@@ -5,11 +5,13 @@ This repository contains the code for the numerical experiments of the paper "Es
 
 Please cite the paper, if you use the code.
 
+```
 @article{ManifoldVAEs,
   author  = {Paola Causin and Alessio Marta},
   title   = {Estimation of Intrinsic Data Structures via Singular Metrics in VAEs: Application to Inverse Problems},
-  eprint = {https://arxiv.org/abs/2507.07291},
+  eprint = {https://arxiv.org/abs/2507.07291}
 }
+```
 
 The code for the mixture of VAEs is an adaption of https://github.com/johertrich/Manifold_Mixture_VAEs to non-invertible VAEs.
 
